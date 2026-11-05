@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -90,13 +91,20 @@ func Open(cfg Config) (*Store, error) {
 	) WITHOUT ROWID`); err != nil {
 		return nil, err
 	}
+	if _, err := db.Exec(`ALTER TABLE objects ADD COLUMN metadata TEXT`); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		return nil, err
+	}
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS multipart_uploads (
 		id TEXT PRIMARY KEY,
 		bucket TEXT NOT NULL,
 		key TEXT NOT NULL,
 		content_type TEXT NOT NULL,
+		metadata TEXT,
 		created_at TEXT NOT NULL
 	)`); err != nil {
+		return nil, err
+	}
+	if _, err := db.Exec(`ALTER TABLE multipart_uploads ADD COLUMN metadata TEXT`); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 		return nil, err
 	}
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS multipart_parts (
@@ -113,6 +121,25 @@ func Open(cfg Config) (*Store, error) {
 }
 
 func (s *Store) Close() error { return s.db.Close() }
+
+func decodeMeta(raw sql.NullString) map[string]string {
+	if !raw.Valid || raw.String == "" {
+		return nil
+	}
+	out := map[string]string{}
+	if err := json.Unmarshal([]byte(raw.String), &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+func (s *Store) uploadMeta(uploadID string) (map[string]string, error) {
+	var raw sql.NullString
+	if err := s.db.QueryRow(`SELECT metadata FROM multipart_uploads WHERE id=?`, uploadID).Scan(&raw); err != nil {
+		return nil, err
+	}
+	return decodeMeta(raw), nil
+}
 
 func (s *Store) acquire() func() {
 	s.sem <- struct{}{}
@@ -173,7 +200,7 @@ func objectName(key string) string {
 	return "obj-" + hex.EncodeToString(sum[:])
 }
 
-func (s *Store) Put(ctx context.Context, bucket, key string, body io.Reader, size int64, contentType string) (string, error) {
+func (s *Store) Put(ctx context.Context, bucket, key string, body io.Reader, size int64, contentType string, metadata map[string]string) (string, error) {
 	folderID, err := s.folder(ctx, bucket)
 	if err != nil {
 		return "", err
@@ -189,20 +216,23 @@ func (s *Store) Put(ctx context.Context, bucket, key string, body io.Reader, siz
 		return "", err
 	}
 	etag := hex.EncodeToString(hash.Sum(nil))
-	if _, err := s.db.Exec(`INSERT INTO objects (bucket,key,drive_id,size,etag,content_type,modified)
-		VALUES (?,?,?,?,?,?,?)
+	rawMeta, _ := json.Marshal(metadata)
+	if _, err := s.db.Exec(`INSERT INTO objects (bucket,key,drive_id,size,etag,content_type,metadata,modified)
+		VALUES (?,?,?,?,?,?,?,?)
 		ON CONFLICT(bucket,key) DO UPDATE SET drive_id=excluded.drive_id,size=excluded.size,
-		etag=excluded.etag,content_type=excluded.content_type,modified=excluded.modified`,
-		bucket, key, driveID, size, etag, contentType, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		etag=excluded.etag,content_type=excluded.content_type,metadata=excluded.metadata,modified=excluded.modified`,
+		bucket, key, driveID, size, etag, contentType, string(rawMeta), time.Now().UTC().Format(time.RFC3339)); err != nil {
 		return "", err
 	}
 	return etag, nil
 }
 
-func (s *Store) lookup(ctx context.Context, bucket, key string) (driveID string, size int64, etag, contentType string, err error) {
-	row := s.db.QueryRow(`SELECT drive_id,size,etag,content_type FROM objects WHERE bucket=? AND key=?`, bucket, key)
-	err = row.Scan(&driveID, &size, &etag, &contentType)
+func (s *Store) lookup(ctx context.Context, bucket, key string) (driveID string, size int64, etag, contentType string, metadata map[string]string, err error) {
+	var rawMeta sql.NullString
+	row := s.db.QueryRow(`SELECT drive_id,size,etag,content_type,metadata FROM objects WHERE bucket=? AND key=?`, bucket, key)
+	err = row.Scan(&driveID, &size, &etag, &contentType, &rawMeta)
 	if err == nil {
+		metadata = decodeMeta(rawMeta)
 		return
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
@@ -211,24 +241,24 @@ func (s *Store) lookup(ctx context.Context, bucket, key string) (driveID string,
 	// Self-healing: a lost index row must not hide an object that exists.
 	folderID, ferr := s.folder(ctx, bucket)
 	if ferr != nil {
-		return "", 0, "", "", ErrNotFound
+		return "", 0, "", "", nil, ErrNotFound
 	}
 	release := s.acquire()
 	id, sz, ferr := s.blobs.FindByName(ctx, folderID, objectName(key))
 	release()
 	if ferr != nil {
-		return "", 0, "", "", ErrNotFound
+		return "", 0, "", "", nil, ErrNotFound
 	}
 	_, _ = s.db.Exec(`INSERT INTO objects (bucket,key,drive_id,size,etag,content_type,modified)
 		VALUES (?,?,?,?,?,?,?) ON CONFLICT(bucket,key) DO UPDATE SET drive_id=excluded.drive_id`,
 		bucket, key, id, sz, "", "application/octet-stream", time.Now().UTC().Format(time.RFC3339))
-	return id, sz, "", "application/octet-stream", nil
+	return id, sz, "", "application/octet-stream", nil, nil
 }
 
-func (s *Store) Get(ctx context.Context, bucket, key string, offset, length int64) (io.ReadCloser, int64, int, string, string, error) {
-	driveID, size, etag, contentType, err := s.lookup(ctx, bucket, key)
+func (s *Store) Get(ctx context.Context, bucket, key string, offset, length int64) (io.ReadCloser, int64, int, string, string, map[string]string, error) {
+	driveID, size, etag, contentType, metadata, err := s.lookup(ctx, bucket, key)
 	if err != nil {
-		return nil, 0, 0, "", "", err
+		return nil, 0, 0, "", "", nil, err
 	}
 	release := s.acquire()
 	body, total, status, err := s.blobs.OpenRange(ctx, driveID, offset, length)
@@ -237,29 +267,29 @@ func (s *Store) Get(ctx context.Context, bucket, key string, offset, length int6
 		// The Drive file may have been renamed or removed; drop the stale row and
 		// resolve the deterministic name again before answering 404.
 		_, _ = s.db.Exec(`DELETE FROM objects WHERE bucket=? AND key=?`, bucket, key)
-		if driveID, size, etag, contentType, err = s.lookup(ctx, bucket, key); err != nil {
-			return nil, 0, 0, "", "", err
+		if driveID, size, etag, contentType, metadata, err = s.lookup(ctx, bucket, key); err != nil {
+			return nil, 0, 0, "", "", nil, err
 		}
 		release := s.acquire()
 		body, total, status, err = s.blobs.OpenRange(ctx, driveID, offset, length)
 		release()
 	}
 	if err != nil {
-		return nil, 0, 0, "", "", err
+		return nil, 0, 0, "", "", nil, err
 	}
 	if total <= 0 {
 		total = size
 	}
-	return body, total, status, etag, contentType, nil
+	return body, total, status, etag, contentType, metadata, nil
 }
 
-func (s *Store) Stat(ctx context.Context, bucket, key string) (size int64, etag, contentType string, err error) {
-	_, size, etag, contentType, err = s.lookup(ctx, bucket, key)
-	return size, etag, contentType, err
+func (s *Store) Stat(ctx context.Context, bucket, key string) (size int64, etag, contentType string, metadata map[string]string, err error) {
+	_, size, etag, contentType, metadata, err = s.lookup(ctx, bucket, key)
+	return
 }
 
 func (s *Store) Delete(ctx context.Context, bucket, key string) error {
-	driveID, _, _, _, err := s.lookup(ctx, bucket, key)
+	driveID, _, _, _, _, err := s.lookup(ctx, bucket, key)
 	if err != nil {
 		return ErrNotFound
 	}
@@ -313,13 +343,14 @@ type MultipartUpload struct {
 	ContentType string
 }
 
-func (s *Store) CreateMultipart(bucket, key, contentType string) (string, error) {
+func (s *Store) CreateMultipart(bucket, key, contentType string, metadata map[string]string) (string, error) {
 	id := fmt.Sprintf("mpu-%d-%s", time.Now().UnixNano(), randomSuffix())
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
-	_, err := s.db.Exec(`INSERT INTO multipart_uploads (id,bucket,key,content_type,created_at) VALUES (?,?,?,?,?)`,
-		id, bucket, key, contentType, time.Now().UTC().Format(time.RFC3339))
+	rawMeta, _ := json.Marshal(metadata)
+	_, err := s.db.Exec(`INSERT INTO multipart_uploads (id,bucket,key,content_type,metadata,created_at) VALUES (?,?,?,?,?,?)`,
+		id, bucket, key, contentType, string(rawMeta), time.Now().UTC().Format(time.RFC3339))
 	return id, err
 }
 
@@ -406,7 +437,11 @@ func (s *Store) CompleteMultipart(ctx context.Context, uploadID string, parts []
 		readers = append(readers, file)
 		total += size
 	}
-	etag, err := s.Put(ctx, bucket, key, io.MultiReader(readers...), total, contentType)
+	meta, err := s.uploadMeta(uploadID)
+	if err != nil {
+		return "", err
+	}
+	etag, err := s.Put(ctx, bucket, key, io.MultiReader(readers...), total, contentType, meta)
 	if err != nil {
 		return "", err
 	}

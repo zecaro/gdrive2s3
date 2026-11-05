@@ -27,21 +27,27 @@ const (
 )
 
 type fakeStore struct {
-	objects map[string][]byte
-	uploads map[string]store.MultipartUpload
-	parts   map[string]map[int][]byte
-	nextID  int
+	objects  map[string][]byte
+	getCalls int
+	uploads  map[string]store.MultipartUpload
+	parts    map[string]map[int][]byte
+	meta     map[string]map[string]string
+	upMeta   map[string]map[string]string
+	nextID   int
 }
 
 func newFake() *fakeStore {
-	return &fakeStore{objects: map[string][]byte{}, uploads: map[string]store.MultipartUpload{}, parts: map[string]map[int][]byte{}}
+	return &fakeStore{objects: map[string][]byte{}, uploads: map[string]store.MultipartUpload{}, parts: map[string]map[int][]byte{}, meta: map[string]map[string]string{}, upMeta: map[string]map[string]string{}}
 }
 
-func (f *fakeStore) CreateMultipart(bucket, key, contentType string) (string, error) {
+func (f *fakeStore) CreateMultipart(bucket, key, contentType string, metadata map[string]string) (string, error) {
 	f.nextID++
 	id := "mpu-" + string(rune('0'+f.nextID))
 	f.uploads[id] = store.MultipartUpload{ID: id, Bucket: bucket, Key: key, ContentType: contentType}
 	f.parts[id] = map[int][]byte{}
+	if metadata != nil {
+		f.upMeta[id] = metadata
+	}
 	return id, nil
 }
 
@@ -71,12 +77,13 @@ func (f *fakeStore) CompleteMultipart(_ context.Context, uploadID string, parts 
 		}
 		buf.Write(data)
 	}
-	return f.Put(context.Background(), upload.Bucket, upload.Key, bytes.NewReader(buf.Bytes()), int64(buf.Len()), upload.ContentType)
+	return f.Put(context.Background(), upload.Bucket, upload.Key, bytes.NewReader(buf.Bytes()), int64(buf.Len()), upload.ContentType, f.upMeta[uploadID])
 }
 
 func (f *fakeStore) AbortMultipart(uploadID string) error {
 	delete(f.uploads, uploadID)
 	delete(f.parts, uploadID)
+	delete(f.upMeta, uploadID)
 	return nil
 }
 
@@ -88,38 +95,43 @@ func (f *fakeStore) UploadExists(uploadID string) (store.MultipartUpload, error)
 	return upload, nil
 }
 
-func (f *fakeStore) Put(_ context.Context, bucket, key string, body io.Reader, size int64, _ string) (string, error) {
+func (f *fakeStore) Put(_ context.Context, bucket, key string, body io.Reader, size int64, _ string, metadata map[string]string) (string, error) {
 	data, err := io.ReadAll(body)
 	if err != nil {
 		return "", err
 	}
 	f.objects[bucket+"/"+key] = data
+	if metadata != nil {
+		f.meta[bucket+"/"+key] = metadata
+	}
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:]), nil
 }
 
-func (f *fakeStore) Get(_ context.Context, bucket, key string, offset, length int64) (io.ReadCloser, int64, int, string, string, error) {
+func (f *fakeStore) Get(_ context.Context, bucket, key string, offset, length int64) (io.ReadCloser, int64, int, string, string, map[string]string, error) {
+	f.getCalls++
 	data, ok := f.objects[bucket+"/"+key]
 	if !ok {
-		return nil, 0, 0, "", "", store.ErrNotFound
+		return nil, 0, 0, "", "", nil, store.ErrNotFound
 	}
 	total := int64(len(data))
+	meta := f.meta[bucket+"/"+key]
 	if length <= 0 {
-		return io.NopCloser(bytes.NewReader(data)), total, http.StatusOK, "etag", "video/mp4", nil
+		return io.NopCloser(bytes.NewReader(data)), total, http.StatusOK, "etag", "video/mp4", meta, nil
 	}
 	end := offset + length
 	if end > total {
 		end = total
 	}
-	return io.NopCloser(bytes.NewReader(data[offset:end])), total, http.StatusPartialContent, "etag", "video/mp4", nil
+	return io.NopCloser(bytes.NewReader(data[offset:end])), total, http.StatusPartialContent, "etag", "video/mp4", meta, nil
 }
 
-func (f *fakeStore) Stat(_ context.Context, bucket, key string) (int64, string, string, error) {
+func (f *fakeStore) Stat(_ context.Context, bucket, key string) (int64, string, string, map[string]string, error) {
 	data, ok := f.objects[bucket+"/"+key]
 	if !ok {
-		return 0, "", "", store.ErrNotFound
+		return 0, "", "", nil, store.ErrNotFound
 	}
-	return int64(len(data)), "etag", "video/mp4", nil
+	return int64(len(data)), "etag", "video/mp4", f.meta[bucket+"/"+key], nil
 }
 
 func (f *fakeStore) Delete(_ context.Context, bucket, key string) error {
@@ -291,5 +303,72 @@ func TestMultipartFlow(t *testing.T) {
 	handler.ServeHTTP(rec, signed(t, http.MethodGet, "https://s3.test/archive/big.bin", nil, ""))
 	if got := rec.Body.String(); got != "hello world" {
 		t.Fatalf("corpo=%q", got)
+	}
+}
+
+func TestUserMetadataRoundTrip(t *testing.T) {
+	srv := newServer()
+	handler := srv.Handler()
+	req := signed(t, http.MethodPut, "https://s3.test/archive/meta.txt", []byte("x"), "")
+	req.Header.Set("x-amz-meta-ingest", "1")
+	req.Header.Set("x-amz-meta-synopsis", "resumo")
+	// assinatura cobre só os headers assinados; o gateway lê x-amz-meta do request.
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("put=%d %s", rec.Code, rec.Body.String())
+	}
+	for _, method := range []string{http.MethodHead, http.MethodGet} {
+		rec = httptest.NewRecorder()
+		handler.ServeHTTP(rec, signed(t, method, "https://s3.test/archive/meta.txt", nil, ""))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s=%d", method, rec.Code)
+		}
+		if got := rec.Header().Get("x-amz-meta-ingest"); got != "1" {
+			t.Fatalf("%s metadata ingest=%q", method, got)
+		}
+		if got := rec.Header().Get("x-amz-meta-synopsis"); got != "resumo" {
+			t.Fatalf("%s metadata synopsis=%q", method, got)
+		}
+	}
+}
+
+func TestMultipartMetadataRoundTrip(t *testing.T) {
+	srv := newServer()
+	handler := srv.Handler()
+	initReq := signed(t, http.MethodPost, "https://s3.test/archive/mpu-meta.bin?uploads", nil, "")
+	initReq.Header.Set("x-amz-meta-ingest", "1")
+	initReq.Header.Set("x-amz-meta-synopsis", "resumo")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, initReq)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("initiate=%d", rec.Code)
+	}
+	var init struct {
+		UploadID string `xml:"UploadId"`
+	}
+	if err := xml.Unmarshal(rec.Body.Bytes(), &init); err != nil || init.UploadID == "" {
+		t.Fatalf("uploadId=%q", rec.Body.String())
+	}
+	part := []byte("payload")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, signed(t, http.MethodPut, "https://s3.test/archive/mpu-meta.bin?partNumber=1&uploadId="+init.UploadID, part, ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("part=%d", rec.Code)
+	}
+	etag := rec.Header().Get("ETag")
+	complete := "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>" + etag + "</ETag></Part></CompleteMultipartUpload>"
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, signed(t, http.MethodPost, "https://s3.test/archive/mpu-meta.bin?uploadId="+init.UploadID, []byte(complete), ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("complete=%d %s", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, signed(t, http.MethodHead, "https://s3.test/archive/mpu-meta.bin", nil, ""))
+	if got := rec.Header().Get("x-amz-meta-ingest"); got != "1" {
+		t.Fatalf("metadata perdida no multipart: ingest=%q", got)
+	}
+	if got := rec.Header().Get("x-amz-meta-synopsis"); got != "resumo" {
+		t.Fatalf("metadata perdida no multipart: synopsis=%q", got)
 	}
 }

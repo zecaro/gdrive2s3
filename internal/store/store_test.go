@@ -81,14 +81,14 @@ func newStore(t *testing.T) *Store {
 func TestRoundTrip(t *testing.T) {
 	st := newStore(t)
 	ctx := context.Background()
-	etag, err := st.Put(ctx, "b", "a/one.txt", strings.NewReader("hello"), 5, "text/plain")
+	etag, err := st.Put(ctx, "b", "a/one.txt", strings.NewReader("hello"), 5, "text/plain", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if etag != "5d41402abc4b2a76b9719d911017c592" {
 		t.Fatalf("etag=%s", etag)
 	}
-	body, total, status, gotETag, contentType, err := st.Get(ctx, "b", "a/one.txt", 1, 3)
+	body, total, status, gotETag, contentType, _, err := st.Get(ctx, "b", "a/one.txt", 1, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +100,7 @@ func TestRoundTrip(t *testing.T) {
 	if err := st.Delete(ctx, "b", "a/one.txt"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, _, _, err := st.Get(ctx, "b", "a/one.txt", 0, 0); err == nil {
+	if _, _, _, _, _, _, err := st.Get(ctx, "b", "a/one.txt", 0, 0); err == nil {
 		t.Fatal("deleted object must disappear")
 	}
 }
@@ -109,7 +109,7 @@ func TestListPagination(t *testing.T) {
 	st := newStore(t)
 	ctx := context.Background()
 	for _, key := range []string{"p/1", "p/2", "p/3", "q/1"} {
-		if _, err := st.Put(ctx, "b", key, strings.NewReader("x"), 1, ""); err != nil {
+		if _, err := st.Put(ctx, "b", key, strings.NewReader("x"), 1, "", nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -138,7 +138,7 @@ func BenchmarkList1000(b *testing.B) {
 	ctx := context.Background()
 	for i := 0; i < 1000; i++ {
 		key := "media/" + strings.Repeat("a", 8) + string(rune('a'+i%26)) + "-" + itoa(i)
-		if _, err := st.Put(ctx, "b", key, strings.NewReader("x"), 1, ""); err != nil {
+		if _, err := st.Put(ctx, "b", key, strings.NewReader("x"), 1, "", nil); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -178,7 +178,7 @@ func TestGetHealsStaleIndex(t *testing.T) {
 	if _, err := st.db.Exec(`INSERT INTO objects (bucket,key,drive_id,size,etag,content_type,modified) VALUES ('b','k','gone',0,'','','')`); err != nil {
 		t.Fatal(err)
 	}
-	body, _, status, _, _, err := st.Get(ctx, "b", "k", 0, 0)
+	body, _, status, _, _, _, err := st.Get(ctx, "b", "k", 0, 0)
 	if err != nil {
 		t.Fatalf("esperava recuperação, veio %v", err)
 	}

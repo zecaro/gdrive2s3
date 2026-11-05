@@ -35,12 +35,12 @@ type Server struct {
 
 // storeAPI is the contract used by the handlers, so tests run without Drive.
 type storeAPI interface {
-	Put(ctx context.Context, bucket, key string, body io.Reader, size int64, contentType string) (string, error)
-	Get(ctx context.Context, bucket, key string, offset, length int64) (io.ReadCloser, int64, int, string, string, error)
-	Stat(ctx context.Context, bucket, key string) (int64, string, string, error)
+	Put(ctx context.Context, bucket, key string, body io.Reader, size int64, contentType string, metadata map[string]string) (string, error)
+	Get(ctx context.Context, bucket, key string, offset, length int64) (io.ReadCloser, int64, int, string, string, map[string]string, error)
+	Stat(ctx context.Context, bucket, key string) (int64, string, string, map[string]string, error)
 	Delete(ctx context.Context, bucket, key string) error
 	List(ctx context.Context, bucket, prefix, startAfter string, max int) ([]store.Object, bool, error)
-	CreateMultipart(bucket, key, contentType string) (string, error)
+	CreateMultipart(bucket, key, contentType string, metadata map[string]string) (string, error)
 	PutPart(uploadID string, partNumber int, body io.Reader) (string, error)
 	CompleteMultipart(ctx context.Context, uploadID string, parts []store.Part) (string, error)
 	AbortMultipart(uploadID string) error
@@ -56,6 +56,27 @@ func New(st storeAPI, cfg Config) *Server {
 }
 
 func (s *Server) Handler() http.Handler { return http.HandlerFunc(s.serveHTTP) }
+
+// userMetadata lê os headers x-amz-meta-* e devolve sem o prefixo.
+func userMetadata(r *http.Request) map[string]string {
+	out := map[string]string{}
+	for name, values := range r.Header {
+		lower := strings.ToLower(name)
+		if strings.HasPrefix(lower, "x-amz-meta-") && len(values) > 0 {
+			out[lower[len("x-amz-meta-"):]] = values[0]
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func writeUserMetadata(h http.Header, metadata map[string]string) {
+	for key, value := range metadata {
+		h.Set("x-amz-meta-"+key, value)
+	}
+}
 
 func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	// Health without a signature: systemd and the tunnel probe it.
@@ -205,7 +226,7 @@ func (s *Server) put(ctx context.Context, w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusLengthRequired, "MissingContentLength", "envie Content-Length")
 		return
 	}
-	etag, err := s.store.Put(ctx, bucket, key, r.Body, r.ContentLength, r.Header.Get("Content-Type"))
+	etag, err := s.store.Put(ctx, bucket, key, r.Body, r.ContentLength, r.Header.Get("Content-Type"), userMetadata(r))
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -215,6 +236,22 @@ func (s *Server) put(ctx context.Context, w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) get(ctx context.Context, w http.ResponseWriter, r *http.Request, bucket, key string) {
+	if r.Method == http.MethodHead {
+		size, etag, contentType, metadata, err := s.store.Stat(ctx, bucket, key)
+		if err != nil {
+			s.fail(w, err)
+			return
+		}
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+		if etag != "" {
+			w.Header().Set("ETag", `"`+etag+`"`)
+		}
+		writeUserMetadata(w.Header(), metadata)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	offset, length := int64(0), int64(0)
 	rangeHeader := r.Header.Get("Range")
 	if rangeHeader != "" {
@@ -228,7 +265,7 @@ func (s *Server) get(ctx context.Context, w http.ResponseWriter, r *http.Request
 		offset, length = parsedOffset, parsedLength
 	}
 
-	body, total, status, etag, contentType, err := s.store.Get(ctx, bucket, key, offset, length)
+	body, total, status, etag, contentType, metadata, err := s.store.Get(ctx, bucket, key, offset, length)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -246,6 +283,7 @@ func (s *Server) get(ctx context.Context, w http.ResponseWriter, r *http.Request
 	if etag != "" {
 		w.Header().Set("ETag", `"`+etag+`"`)
 	}
+	writeUserMetadata(w.Header(), metadata)
 	if rangeHeader != "" && status == http.StatusPartialContent && length > 0 {
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, offset+length-1, total))
 		w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
@@ -300,7 +338,7 @@ func writeXML(w http.ResponseWriter, status int, payload any) {
 func (s *Server) post(ctx context.Context, w http.ResponseWriter, r *http.Request, bucket, key string) {
 	query := r.URL.Query()
 	if _, ok := query["uploads"]; ok {
-		uploadID, err := s.store.CreateMultipart(bucket, key, r.Header.Get("Content-Type"))
+		uploadID, err := s.store.CreateMultipart(bucket, key, r.Header.Get("Content-Type"), userMetadata(r))
 		if err != nil {
 			s.fail(w, err)
 			return
