@@ -2,5 +2,6 @@
 Description=gdrive2s3 incremental backup (hourly)
 [Service]
 Type=oneshot
+TimeoutStartSec=20min
 EnvironmentFile=-/root/.backup-alerts.env
 ExecStart=/usr/local/sbin/gdrive2s3-backup incremental
