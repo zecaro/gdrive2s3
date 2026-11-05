@@ -1,0 +1,7 @@
+[Unit]
+Description=gdrive2s3 full backup daily
+[Timer]
+OnCalendar=*-*-* 04:15:00
+Persistent=true
+[Install]
+WantedBy=timers.target

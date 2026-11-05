@@ -50,9 +50,24 @@ type Store struct {
 	tmp     string
 	mu      sync.Mutex
 	folders map[string]string
+	sem     chan struct{}
 }
 
-func Open(path string, blobs Blobs, root, tmp string) (*Store, error) {
+// Config wires the store. MaxConcurrent caps simultaneous Drive calls.
+type Config struct {
+	Path          string
+	Root          string
+	Tmp           string
+	Blobs         Blobs
+	MaxConcurrent int
+}
+
+func Open(cfg Config) (*Store, error) {
+	path, blobs, root, tmp := cfg.Path, cfg.Blobs, cfg.Root, cfg.Tmp
+	limit := cfg.MaxConcurrent
+	if limit <= 0 {
+		limit = 8
+	}
 	if tmp == "" {
 		tmp = path + ".parts"
 	}
@@ -94,10 +109,43 @@ func Open(path string, blobs Blobs, root, tmp string) (*Store, error) {
 	)`); err != nil {
 		return nil, err
 	}
-	return &Store{db: db, blobs: blobs, root: root, folders: map[string]string{}, tmp: tmp}, nil
+	return &Store{db: db, blobs: blobs, root: root, folders: map[string]string{}, tmp: tmp, sem: make(chan struct{}, limit)}, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
+
+func (s *Store) acquire() func() {
+	s.sem <- struct{}{}
+	return func() { <-s.sem }
+}
+
+// ImportEntry is one pre-existing Drive file to register in the index.
+type ImportEntry struct {
+	Key         string
+	DriveID     string
+	ContentType string
+	Size        int64
+}
+
+// Import registers objects that already live in Drive, skipping known keys.
+func (s *Store) Import(ctx context.Context, bucket string, entries []ImportEntry) (int, error) {
+	inserted := 0
+	for _, entry := range entries {
+		if entry.Key == "" || entry.DriveID == "" {
+			continue
+		}
+		res, err := s.db.Exec(`INSERT OR IGNORE INTO objects (bucket,key,drive_id,size,etag,content_type,modified)
+			VALUES (?,?,?,?,?,?,?)`, bucket, entry.Key, entry.DriveID, entry.Size, "", entry.ContentType,
+			time.Now().UTC().Format(time.RFC3339))
+		if err != nil {
+			return inserted, err
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			inserted++
+		}
+	}
+	return inserted, nil
+}
 
 func (s *Store) folder(ctx context.Context, bucket string) (string, error) {
 	s.mu.Lock()
@@ -106,7 +154,9 @@ func (s *Store) folder(ctx context.Context, bucket string) (string, error) {
 		return id, nil
 	}
 	s.mu.Unlock()
+	release := s.acquire()
 	id, err := s.blobs.EnsureFolder(ctx, s.root+"-"+bucket)
+	release()
 	if err != nil {
 		return "", err
 	}
@@ -132,7 +182,9 @@ func (s *Store) Put(ctx context.Context, bucket, key string, body io.Reader, siz
 		contentType = "application/octet-stream"
 	}
 	hash := md5.New()
+	release := s.acquire()
 	driveID, err := s.blobs.Put(ctx, folderID, objectName(key), io.TeeReader(body, hash), size, key, contentType)
+	release()
 	if err != nil {
 		return "", err
 	}
@@ -161,7 +213,9 @@ func (s *Store) lookup(ctx context.Context, bucket, key string) (driveID string,
 	if ferr != nil {
 		return "", 0, "", "", ErrNotFound
 	}
+	release := s.acquire()
 	id, sz, ferr := s.blobs.FindByName(ctx, folderID, objectName(key))
+	release()
 	if ferr != nil {
 		return "", 0, "", "", ErrNotFound
 	}
@@ -176,7 +230,9 @@ func (s *Store) Get(ctx context.Context, bucket, key string, offset, length int6
 	if err != nil {
 		return nil, 0, 0, "", "", err
 	}
+	release := s.acquire()
 	body, total, status, err := s.blobs.OpenRange(ctx, driveID, offset, length)
+	release()
 	if errors.Is(err, ErrNotFound) {
 		// The Drive file may have been renamed or removed; drop the stale row and
 		// resolve the deterministic name again before answering 404.
@@ -184,7 +240,9 @@ func (s *Store) Get(ctx context.Context, bucket, key string, offset, length int6
 		if driveID, size, etag, contentType, err = s.lookup(ctx, bucket, key); err != nil {
 			return nil, 0, 0, "", "", err
 		}
+		release := s.acquire()
 		body, total, status, err = s.blobs.OpenRange(ctx, driveID, offset, length)
+		release()
 	}
 	if err != nil {
 		return nil, 0, 0, "", "", err
@@ -205,6 +263,8 @@ func (s *Store) Delete(ctx context.Context, bucket, key string) error {
 	if err != nil {
 		return ErrNotFound
 	}
+	release := s.acquire()
+	defer release()
 	if err := s.blobs.Delete(ctx, driveID); err != nil {
 		return err
 	}

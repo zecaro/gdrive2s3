@@ -1,0 +1,8 @@
+[Unit]
+Description=gdrive2s3 incremental backup every hour
+[Timer]
+OnCalendar=hourly
+AccuracySec=1min
+Persistent=true
+[Install]
+WantedBy=timers.target

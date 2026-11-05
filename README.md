@@ -32,6 +32,8 @@ keeps a SQLite index so reads never walk folders.
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN` | Drive OAuth |
 | `INDEX_DB` | SQLite path (default `/var/lib/gdrive2s3/index.db`) |
 | `FOLDER_ROOT` | Drive folder prefix (default `gdrive2s3`) |
+| `TMP_DIR` | multipart staging directory |
+| `METRICS_LISTEN` | private metrics listener (default `127.0.0.1:8810`) |
 
 ## Run
 
@@ -41,6 +43,35 @@ LISTEN=127.0.0.1:8789 BUCKETS=archive ACCESS_KEY=... SECRET_KEY=... \
 GOOGLE_CLIENT_ID=... GOOGLE_CLIENT_SECRET=... GOOGLE_REFRESH_TOKEN=... \
 ./gdrive2s3
 ```
+
+## Metrics
+
+A private listener serves Prometheus text on `METRICS_LISTEN`, separate from the
+S3 port, so a public tunnel never exposes it:
+
+```
+gdrive2s3_requests_total{method="GET",code="206"} 12
+gdrive2s3_bytes_total 1048576
+```
+
+## Import existing objects
+
+Files already in Drive (for example an rclone backup that kept the original key
+paths) can be registered without copying bytes again:
+
+```bash
+g2s-import -drive-folder tcsspy-media-backup -bucket tcsspy-archive -index /var/lib/gdrive2s3/index.db
+```
+
+The walk reads folder names as key segments, is idempotent and skips known keys.
+
+## Backup
+
+`deploy/backup.sh` copies the media bucket to Drive append-only: an hourly
+`copy --max-age 3h` with an overlapping window and a daily full `copy`. It never
+uses `--delete`, so the source lifecycle cannot truncate the backup. State lands
+in `/var/lib/gdrive2s3/backup.status`; if `TELEGRAM_BOT_TOKEN` and
+`TELEGRAM_CHAT_ID` are set, failures also go to Telegram.
 
 ## Tests and benchmarks
 

@@ -86,6 +86,56 @@ func (c *Client) Put(ctx context.Context, folderID, name string, body io.Reader,
 	return created.Id, nil
 }
 
+// Entry is one item inside a Drive folder.
+type Entry struct {
+	ID       string
+	Name     string
+	MimeType string
+	Size     int64
+	IsFolder bool
+}
+
+// ListFolder returns the direct children of a folder, following pagination.
+func (c *Client) ListFolder(ctx context.Context, folderID string) ([]Entry, error) {
+	var out []Entry
+	pageToken := ""
+	for {
+		call := c.svc.Files.List().
+			Q(fmt.Sprintf("%q in parents and trashed = false", folderID)).
+			Fields("nextPageToken, files(id,name,mimeType,size)").
+			PageSize(1000).
+			Context(ctx)
+		if pageToken != "" {
+			call = call.PageToken(pageToken)
+		}
+		list, err := call.Do()
+		if err != nil {
+			return nil, err
+		}
+		for _, file := range list.Files {
+			out = append(out, Entry{ID: file.Id, Name: file.Name, MimeType: file.MimeType, Size: file.Size,
+				IsFolder: file.MimeType == "application/vnd.google-apps.folder"})
+		}
+		if list.NextPageToken == "" {
+			return out, nil
+		}
+		pageToken = list.NextPageToken
+	}
+}
+
+// FolderIDByName resolves a folder in the Drive root.
+func (c *Client) FolderIDByName(ctx context.Context, name string) (string, error) {
+	query := fmt.Sprintf("name = %q and mimeType = 'application/vnd.google-apps.folder' and trashed = false and 'root' in parents", name)
+	list, err := c.svc.Files.List().Q(query).Fields("files(id)").PageSize(1).Context(ctx).Do()
+	if err != nil {
+		return "", err
+	}
+	if len(list.Files) == 0 {
+		return "", ErrNotFound
+	}
+	return list.Files[0].Id, nil
+}
+
 func (c *Client) FindByName(ctx context.Context, folderID, name string) (string, int64, error) {
 	query := fmt.Sprintf("name = %q and trashed = false and %q in parents", name, folderID)
 	list, err := c.svc.Files.List().Q(query).Fields("files(id,size)").PageSize(1).Context(ctx).Do()

@@ -70,7 +70,7 @@ func (m *memBlobs) Delete(_ context.Context, fileID string) error {
 
 func newStore(t *testing.T) *Store {
 	t.Helper()
-	st, err := Open(filepath.Join(t.TempDir(), "index.db"), newMem(), "root", "")
+	st, err := Open(Config{Path: filepath.Join(t.TempDir(), "index.db"), Root: "root", Blobs: newMem()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestListPagination(t *testing.T) {
 }
 
 func BenchmarkList1000(b *testing.B) {
-	st, err := Open(filepath.Join(b.TempDir(), "bench.db"), newMem(), "root", "")
+	st, err := Open(Config{Path: filepath.Join(b.TempDir(), "bench.db"), Root: "root", Blobs: newMem()})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -170,7 +170,7 @@ func TestGetHealsStaleIndex(t *testing.T) {
 	if _, err := mem.Put(ctx, folder, objectName("k"), strings.NewReader("alive"), 5, "k", "text/plain"); err != nil {
 		t.Fatal(err)
 	}
-	st, err := Open(filepath.Join(t.TempDir(), "index.db"), mem, "root", "")
+	st, err := Open(Config{Path: filepath.Join(t.TempDir(), "index.db"), Root: "root", Blobs: mem})
 	if err != nil {
 		t.Fatal(err)
 	}

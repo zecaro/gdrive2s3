@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/zecaro/gdrive2s3/internal/drive"
+	"github.com/zecaro/gdrive2s3/internal/metrics"
 	"github.com/zecaro/gdrive2s3/internal/s3api"
 	"github.com/zecaro/gdrive2s3/internal/store"
 )
@@ -40,7 +41,12 @@ func main() {
 		logger.Error("drive: failed to start", "err", err)
 		os.Exit(1)
 	}
-	st, err := store.Open(indexPath, client, root, os.Getenv("TMP_DIR"))
+	st, err := store.Open(store.Config{
+		Path:  indexPath,
+		Root:  root,
+		Tmp:   os.Getenv("TMP_DIR"),
+		Blobs: client,
+	})
 	if err != nil {
 		logger.Error("index: failed to open", "err", err)
 		os.Exit(1)
@@ -76,16 +82,24 @@ func main() {
 		Logger:    logger,
 	})
 
+	registry := metrics.New()
 	httpServer := &http.Server{
 		Addr:              listen,
-		Handler:           server.Handler(),
+		Handler:           metrics.Middleware(registry, server.Handler()),
 		ReadHeaderTimeout: 15 * time.Second,
 	}
+	metricsServer := &http.Server{Addr: env("METRICS_LISTEN", "127.0.0.1:8810"), Handler: registry.Handler(), ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		if err := metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("metrics", "err", err)
+		}
+	}()
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = httpServer.Shutdown(shutdownCtx)
+		_ = metricsServer.Shutdown(shutdownCtx)
 	}()
 
 	logger.Info("gdrive2s3 listening", "listen", listen, "buckets", len(buckets))
