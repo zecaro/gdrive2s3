@@ -1,0 +1,18 @@
+[Unit]
+Description=gdrive2s3 (S3 sobre Google Drive)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=prod
+Group=prod
+EnvironmentFile=/srv/tcsspy/gdrive2s3.env
+ExecStart=/srv/tcsspy/gdrive2s3/gdrive2s3
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
