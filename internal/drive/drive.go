@@ -62,13 +62,36 @@ func (c *Client) EnsureFolder(ctx context.Context, name string) (string, error) 
 	return created.Id, nil
 }
 
-// Put uploads the object under a deterministic name and keeps the original key in appProperties.
+// keyProperty is the appProperty name that carries the original object key.
+const keyProperty = "gdrive2s3-key"
+
+// drivePropertyLimit is Google Drive's cap on the summed length of an
+// appProperty's name and value. Uploads that exceed it fail with
+// 403 propertyLengthLimitExceeded, which looked like a storage outage.
+const drivePropertyLimit = 124
+
+// propertyValue reports the appProperty value for a key and whether it fits.
+// The SQLite index is the source of truth for bucket/key -> Drive id, so the
+// property is only a convenience for humans reading Drive: when the key would
+// blow Drive's limit (sandbox artefacts, long document names) it is dropped
+// instead of failing the whole upload.
+func propertyValue(key string) (string, bool) {
+	if len(keyProperty)+len(key) > drivePropertyLimit {
+		return "", false
+	}
+	return key, true
+}
+
+// Put uploads the object under a deterministic name and, when the key fits
+// Drive's appProperty limit, keeps the original key as metadata.
 func (c *Client) Put(ctx context.Context, folderID, name string, body io.Reader, size int64, key, contentType string) (string, error) {
 	file := &drive.File{
-		Name:          name,
-		Parents:       []string{folderID},
-		MimeType:      contentType,
-		AppProperties: map[string]string{"gdrive2s3-key": key},
+		Name:     name,
+		Parents:  []string{folderID},
+		MimeType: contentType,
+	}
+	if value, ok := propertyValue(key); ok {
+		file.AppProperties = map[string]string{keyProperty: value}
 	}
 	call := c.svc.Files.Create(file).Fields("id").Context(ctx)
 	// Cap the resumable chunk: ChunkSize(size) would allocate the whole object
