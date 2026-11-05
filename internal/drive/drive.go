@@ -10,13 +10,15 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/zecaro/gdrive2s3/internal/errs"
 	"golang.org/x/oauth2"
 	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 )
 
-var ErrNotFound = errors.New("file not found in Drive")
+// ErrNotFound aliases the shared sentinel.
+var ErrNotFound = errs.ErrNotFound
 
 type Client struct {
 	svc     *drive.Service
@@ -69,11 +71,14 @@ func (c *Client) Put(ctx context.Context, folderID, name string, body io.Reader,
 		AppProperties: map[string]string{"gdrive2s3-key": key},
 	}
 	call := c.svc.Files.Create(file).Fields("id").Context(ctx)
-	if size > 0 {
-		call = call.Media(body, googleapi.ChunkSize(int(size)))
-	} else {
-		call = call.Media(body)
+	// Cap the resumable chunk: ChunkSize(size) would allocate the whole object
+	// in memory for a large file.
+	const maxChunk = 8 << 20
+	chunk := int64(maxChunk)
+	if size > 0 && size < chunk {
+		chunk = size
 	}
+	call = call.Media(body, googleapi.ChunkSize(int(chunk)))
 	created, err := call.Do()
 	if err != nil {
 		return "", err

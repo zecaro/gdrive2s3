@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -27,9 +28,65 @@ const (
 
 type fakeStore struct {
 	objects map[string][]byte
+	uploads map[string]store.MultipartUpload
+	parts   map[string]map[int][]byte
+	nextID  int
 }
 
-func newFake() *fakeStore { return &fakeStore{objects: map[string][]byte{}} }
+func newFake() *fakeStore {
+	return &fakeStore{objects: map[string][]byte{}, uploads: map[string]store.MultipartUpload{}, parts: map[string]map[int][]byte{}}
+}
+
+func (f *fakeStore) CreateMultipart(bucket, key, contentType string) (string, error) {
+	f.nextID++
+	id := "mpu-" + string(rune('0'+f.nextID))
+	f.uploads[id] = store.MultipartUpload{ID: id, Bucket: bucket, Key: key, ContentType: contentType}
+	f.parts[id] = map[int][]byte{}
+	return id, nil
+}
+
+func (f *fakeStore) PutPart(uploadID string, partNumber int, body io.Reader) (string, error) {
+	if _, ok := f.parts[uploadID]; !ok {
+		return "", store.ErrNotFound
+	}
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return "", err
+	}
+	f.parts[uploadID][partNumber] = data
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func (f *fakeStore) CompleteMultipart(_ context.Context, uploadID string, parts []store.Part) (string, error) {
+	upload, ok := f.uploads[uploadID]
+	if !ok {
+		return "", store.ErrNotFound
+	}
+	var buf bytes.Buffer
+	for _, part := range parts {
+		data, ok := f.parts[uploadID][part.Number]
+		if !ok {
+			return "", store.ErrNotFound
+		}
+		buf.Write(data)
+	}
+	return f.Put(context.Background(), upload.Bucket, upload.Key, bytes.NewReader(buf.Bytes()), int64(buf.Len()), upload.ContentType)
+}
+
+func (f *fakeStore) AbortMultipart(uploadID string) error {
+	delete(f.uploads, uploadID)
+	delete(f.parts, uploadID)
+	return nil
+}
+
+func (f *fakeStore) UploadExists(uploadID string) (store.MultipartUpload, error) {
+	upload, ok := f.uploads[uploadID]
+	if !ok {
+		return upload, store.ErrNotFound
+	}
+	return upload, nil
+}
 
 func (f *fakeStore) Put(_ context.Context, bucket, key string, body io.Reader, size int64, _ string) (string, error) {
 	data, err := io.ReadAll(body)
@@ -188,5 +245,51 @@ func BenchmarkGetRange(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		rec := httptest.NewRecorder()
 		srv.Handler().ServeHTTP(rec, req.Clone(context.Background()))
+	}
+}
+
+func itoa(n int) string { return strconv.Itoa(n) }
+
+func TestMultipartFlow(t *testing.T) {
+	srv := newServer()
+	handler := srv.Handler()
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, signed(t, http.MethodPost, "https://s3.test/archive/big.bin?uploads", nil, ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("initiate=%d %s", rec.Code, rec.Body.String())
+	}
+	var init struct {
+		UploadID string `xml:"UploadId"`
+	}
+	if err := xml.Unmarshal(rec.Body.Bytes(), &init); err != nil || init.UploadID == "" {
+		t.Fatalf("uploadId: %v %q", err, rec.Body.String())
+	}
+
+	part1 := []byte("hello ")
+	part2 := []byte("world")
+	etags := make([]string, 0, 2)
+	for i, part := range [][]byte{part1, part2} {
+		rec = httptest.NewRecorder()
+		target := "https://s3.test/archive/big.bin?partNumber=" + itoa(i+1) + "&uploadId=" + init.UploadID
+		handler.ServeHTTP(rec, signed(t, http.MethodPut, target, part, ""))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("part %d = %d %s", i+1, rec.Code, rec.Body.String())
+		}
+		etags = append(etags, rec.Header().Get("ETag"))
+	}
+
+	complete := "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>" + etags[0] +
+		"</ETag></Part><Part><PartNumber>2</PartNumber><ETag>" + etags[1] + "</ETag></Part></CompleteMultipartUpload>"
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, signed(t, http.MethodPost, "https://s3.test/archive/big.bin?uploadId="+init.UploadID, []byte(complete), ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("complete=%d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, signed(t, http.MethodGet, "https://s3.test/archive/big.bin", nil, ""))
+	if got := rec.Body.String(); got != "hello world" {
+		t.Fatalf("corpo=%q", got)
 	}
 }

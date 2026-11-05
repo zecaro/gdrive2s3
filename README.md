@@ -57,10 +57,17 @@ Local results (Apple M-series, Go 1.27):
 | `BenchmarkGetRange` | ~8.8 µs |
 | `BenchmarkList1000` | ~0.6 ms |
 
+## Multipart
+
+`CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload` and
+`AbortMultipartUpload` are supported. Parts are written to `TMP_DIR` and the
+complete step streams them into a single Drive upload, so memory stays flat
+regardless of object size. Abandoned sessions are removed after 24 hours.
+
 ## Limitations
 
-- No multipart: simple `PUT` with `Content-Length`. Enough for current media
-  (largest object measured: 54 MiB) and for `rclone copy` below 200 MiB.
-- One Drive file per object; renaming in Drive breaks the index, which recovers
-  from the deterministic name.
-- No versioning or lifecycle: expiration is the caller's responsibility.
+- One Drive file per object. If the file is renamed or removed in Drive, the read
+  path drops the stale index row, resolves the deterministic name again and
+  answers from the new id; if it is truly gone, the answer is 404.
+- No versioning or lifecycle: expiration is the caller's responsibility. Drive
+  has no object lifecycle API, so retention lives in the caller.

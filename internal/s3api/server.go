@@ -40,6 +40,11 @@ type storeAPI interface {
 	Stat(ctx context.Context, bucket, key string) (int64, string, string, error)
 	Delete(ctx context.Context, bucket, key string) error
 	List(ctx context.Context, bucket, prefix, startAfter string, max int) ([]store.Object, bool, error)
+	CreateMultipart(bucket, key, contentType string) (string, error)
+	PutPart(uploadID string, partNumber int, body io.Reader) (string, error)
+	CompleteMultipart(ctx context.Context, uploadID string, parts []store.Part) (string, error)
+	AbortMultipart(uploadID string) error
+	UploadExists(uploadID string) (store.MultipartUpload, error)
 }
 
 func New(st storeAPI, cfg Config) *Server {
@@ -88,11 +93,21 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	case key == "":
 		writeError(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "method not allowed on bucket")
+	case r.Method == http.MethodPost && key != "":
+		s.post(ctx, w, r, bucket, key)
 	case r.Method == http.MethodPut:
 		s.put(ctx, w, r, bucket, key)
 	case r.Method == http.MethodGet || r.Method == http.MethodHead:
 		s.get(ctx, w, r, bucket, key)
 	case r.Method == http.MethodDelete:
+		if uploadID := r.URL.Query().Get("uploadId"); uploadID != "" {
+			if err := s.store.AbortMultipart(uploadID); err != nil {
+				s.fail(w, err)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		s.delete(ctx, w, bucket, key)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "method not allowed")
@@ -182,12 +197,8 @@ func (s *Server) listOrMeta(w http.ResponseWriter, r *http.Request, bucket strin
 }
 
 func (s *Server) put(ctx context.Context, w http.ResponseWriter, r *http.Request, bucket, key string) {
-	if _, ok := r.URL.Query()["uploads"]; ok {
-		writeError(w, http.StatusNotImplemented, "NotImplemented", "multipart not supported; use a single PUT")
-		return
-	}
 	if uploadID := r.URL.Query().Get("uploadId"); uploadID != "" {
-		writeError(w, http.StatusNotImplemented, "NotImplemented", "multipart not supported; use a single PUT")
+		s.putPart(w, r, uploadID)
 		return
 	}
 	if r.ContentLength < 0 {
@@ -283,4 +294,73 @@ func writeXML(w http.ResponseWriter, status int, payload any) {
 	w.WriteHeader(status)
 	_, _ = w.Write([]byte(xml.Header))
 	_ = xml.NewEncoder(w).Encode(payload)
+}
+
+// post trata o início (POST ?uploads) e a conclusão (POST ?uploadId) do multipart.
+func (s *Server) post(ctx context.Context, w http.ResponseWriter, r *http.Request, bucket, key string) {
+	query := r.URL.Query()
+	if _, ok := query["uploads"]; ok {
+		uploadID, err := s.store.CreateMultipart(bucket, key, r.Header.Get("Content-Type"))
+		if err != nil {
+			s.fail(w, err)
+			return
+		}
+		type initiate struct {
+			XMLName  xml.Name `xml:"InitiateMultipartUploadResult"`
+			Bucket   string   `xml:"Bucket"`
+			Key      string   `xml:"Key"`
+			UploadID string   `xml:"UploadId"`
+		}
+		writeXML(w, http.StatusOK, initiate{Bucket: bucket, Key: key, UploadID: uploadID})
+		return
+	}
+
+	uploadID := query.Get("uploadId")
+	if uploadID == "" {
+		writeError(w, http.StatusBadRequest, "InvalidRequest", "missing uploadId")
+		return
+	}
+	var payload struct {
+		Parts []struct {
+			PartNumber int    `xml:"PartNumber"`
+			ETag       string `xml:"ETag"`
+		} `xml:"Part"`
+	}
+	if err := xml.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeError(w, http.StatusBadRequest, "MalformedXML", "invalid complete body")
+		return
+	}
+	parts := make([]store.Part, 0, len(payload.Parts))
+	for _, part := range payload.Parts {
+		parts = append(parts, store.Part{Number: part.PartNumber, ETag: part.ETag})
+	}
+	etag, err := s.store.CompleteMultipart(ctx, uploadID, parts)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	type complete struct {
+		XMLName  xml.Name `xml:"CompleteMultipartUploadResult"`
+		Location string   `xml:"Location"`
+		Bucket   string   `xml:"Bucket"`
+		Key      string   `xml:"Key"`
+		ETag     string   `xml:"ETag"`
+	}
+	w.Header().Set("ETag", `"`+etag+`"`)
+	writeXML(w, http.StatusOK, complete{Bucket: bucket, Key: key, ETag: `"` + etag + `"`})
+}
+
+func (s *Server) putPart(w http.ResponseWriter, r *http.Request, uploadID string) {
+	partNumber, err := strconv.Atoi(r.URL.Query().Get("partNumber"))
+	if err != nil || partNumber < 1 || partNumber > 10000 {
+		writeError(w, http.StatusBadRequest, "InvalidPart", "invalid partNumber")
+		return
+	}
+	etag, err := s.store.PutPart(uploadID, partNumber, r.Body)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	w.Header().Set("ETag", `"`+etag+`"`)
+	w.WriteHeader(http.StatusOK)
 }

@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/zecaro/gdrive2s3/internal/errs"
 )
 
 type memBlobs struct {
@@ -40,13 +42,16 @@ func (m *memBlobs) Put(_ context.Context, folderID, name string, body io.Reader,
 func (m *memBlobs) FindByName(_ context.Context, folderID, name string) (string, int64, error) {
 	data, ok := m.files[folderID+"/"+name]
 	if !ok {
-		return "", 0, io.EOF
+		return "", 0, errs.ErrNotFound
 	}
 	return folderID + "/" + name, int64(len(data)), nil
 }
 
 func (m *memBlobs) OpenRange(_ context.Context, fileID string, offset, length int64) (io.ReadCloser, int64, int, error) {
-	data := m.files[fileID]
+	data, ok := m.files[fileID]
+	if !ok {
+		return nil, 0, 0, errs.ErrNotFound
+	}
 	total := int64(len(data))
 	if length <= 0 {
 		return io.NopCloser(bytes.NewReader(data)), total, 200, nil
@@ -65,7 +70,7 @@ func (m *memBlobs) Delete(_ context.Context, fileID string) error {
 
 func newStore(t *testing.T) *Store {
 	t.Helper()
-	st, err := Open(filepath.Join(t.TempDir(), "index.db"), newMem(), "root")
+	st, err := Open(filepath.Join(t.TempDir(), "index.db"), newMem(), "root", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +130,7 @@ func TestListPagination(t *testing.T) {
 }
 
 func BenchmarkList1000(b *testing.B) {
-	st, err := Open(filepath.Join(b.TempDir(), "bench.db"), newMem(), "root")
+	st, err := Open(filepath.Join(b.TempDir(), "bench.db"), newMem(), "root", "")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -155,4 +160,31 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(digits)
+}
+
+func TestGetHealsStaleIndex(t *testing.T) {
+	mem := newMem()
+	ctx := context.Background()
+	folder, _ := mem.EnsureFolder(ctx, "root-b")
+	// Objeto existe no Drive, mas o índice aponta para um id que sumiu.
+	if _, err := mem.Put(ctx, folder, objectName("k"), strings.NewReader("alive"), 5, "k", "text/plain"); err != nil {
+		t.Fatal(err)
+	}
+	st, err := Open(filepath.Join(t.TempDir(), "index.db"), mem, "root", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, err := st.db.Exec(`INSERT INTO objects (bucket,key,drive_id,size,etag,content_type,modified) VALUES ('b','k','gone',0,'','','')`); err != nil {
+		t.Fatal(err)
+	}
+	body, _, status, _, _, err := st.Get(ctx, "b", "k", 0, 0)
+	if err != nil {
+		t.Fatalf("esperava recuperação, veio %v", err)
+	}
+	defer body.Close()
+	data, _ := io.ReadAll(body)
+	if string(data) != "alive" || status != 200 {
+		t.Fatalf("corpo=%q status=%d", data, status)
+	}
 }

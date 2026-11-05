@@ -40,12 +40,33 @@ func main() {
 		logger.Error("drive: failed to start", "err", err)
 		os.Exit(1)
 	}
-	st, err := store.Open(indexPath, client, root)
+	st, err := store.Open(indexPath, client, root, os.Getenv("TMP_DIR"))
 	if err != nil {
 		logger.Error("index: failed to open", "err", err)
 		os.Exit(1)
 	}
 	defer st.Close()
+
+	// Abandoned multipart sessions hold temp files; drop them after a day.
+	if removed, err := st.CleanupUploads(ctx, 24*time.Hour); err != nil {
+		logger.Warn("multipart cleanup", "err", err)
+	} else if removed > 0 {
+		logger.Info("multipart cleanup", "removed", removed)
+	}
+	go func() {
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if removed, err := st.CleanupUploads(ctx, 24*time.Hour); err == nil && removed > 0 {
+					logger.Info("multipart cleanup", "removed", removed)
+				}
+			}
+		}
+	}()
 
 	server := s3api.New(st, s3api.Config{
 		AccessKey: env("ACCESS_KEY", ""),
